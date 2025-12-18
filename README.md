@@ -6,7 +6,7 @@ The Altified Worker is a high-performance edge translation layer. It automatical
 
 Click the button below to deploy this worker to your own Cloudflare account instantly.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Wesafa/worker)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/benedictowusu/worker)
 ---
 
 ## 🛠 Features
