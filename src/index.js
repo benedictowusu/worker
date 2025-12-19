@@ -2,6 +2,7 @@
  * Altified Cloudflare Worker - Auto-inject Translation
  * Translates both <head> and <body> content
  * Fetches enabled languages dynamically from API
+ * IMPROVED: Loading spinner + sequential translation (head first, then body)
  */
 
 const CONFIG = {
@@ -238,53 +239,24 @@ async function handleDefaultLanguagePage(request, env, ctx, projectConfig, langu
 
 /* ----------------------------------------
    INJECT AUTO-TRANSLATION SCRIPT
-   IMPROVED: Loading spinner + parallel translation
+   IMPROVED: Loading spinner + sequential translation
 ----------------------------------------- */
 function injectAutoTranslation(html, lang, apiKey) {
 	if (html.includes('__ALTIFIED_AUTO_TRANSLATE__')) return html;
 
 	const script = `
-<style id="__ALTIFIED_LOADER__">
-  #altified-loader {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: rgba(255, 255, 255, 0.95);
-    z-index: 999999;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-direction: column;
-    font-family: system-ui, -apple-system, sans-serif;
+<style id="__ALTIFIED_BLUR__">
+  html {
+    filter: blur(8px);
+    opacity: 0.6;
+    transition: filter 0.3s ease-out, opacity 0.3s ease-out;
   }
   
-  .altified-spinner {
-    width: 50px;
-    height: 50px;
-    border: 4px solid #f3f4f6;
-    border-top: 4px solid #3b82f6;
-    border-radius: 50%;
-    animation: altified-spin 0.8s linear infinite;
-  }
-  
-  @keyframes altified-spin {
-    0% { transform: rotate(0deg); }
-    100% { transform: rotate(360deg); }
-  }
-  
-  .altified-loader-text {
-    margin-top: 16px;
-    color: #6b7280;
-    font-size: 14px;
+  html.altified-translated {
+    filter: none;
+    opacity: 1;
   }
 </style>
-
-<div id="altified-loader">
-  <div class="altified-spinner"></div>
-  <div class="altified-loader-text">Translating page...</div>
-</div>
 
 <script id="__ALTIFIED_AUTO_TRANSLATE__">
 (function() {
@@ -302,44 +274,133 @@ function injectAutoTranslation(html, lang, apiKey) {
     init();
   }
   
-  // Safety: Show content after 1.5 seconds even if translation fails
-  setTimeout(function() {
-    removeLoader();
-  }, 1500);
-  
-  function removeLoader() {
-    var loader = document.getElementById('altified-loader');
-    var loaderStyle = document.getElementById('__ALTIFIED_LOADER__');
-    if (loader) loader.remove();
-    if (loaderStyle) loaderStyle.remove();
-  }
-  
   function init() {
     rewriteInternalLinks();
     translateAllContent();
     startObserver();
   }
   
-  // IMPROVED: Translate head and body in PARALLEL
+  function removeBlur() {
+    document.documentElement.classList.add('altified-translated');
+    // Remove blur style after transition completes
+    setTimeout(function() {
+      var blurStyle = document.getElementById('__ALTIFIED_BLUR__');
+      if (blurStyle) blurStyle.remove();
+    }, 300);
+  }
+  
+  // Parallel translation: head and visible body at the same time (FASTEST)
   async function translateAllContent() {
     if (isTranslating) return;
     isTranslating = true;
     
     try {
-      // Translate both head and body at the same time
+      // Translate head and visible body content in PARALLEL
       await Promise.all([
         translateContent(document.head),
-        translateContent(document.body)
+        translateVisibleContent(document.body)
       ]);
       
-      // Remove loader after translation is done
-      removeLoader();
+      // Remove blur after both are done
+      removeBlur();
+      
+      // Translate remaining below-the-fold content in background
+      await translateBelowFoldContent(document.body);
+      
     } catch (error) {
-      // Remove loader even on error
-      removeLoader();
+      // Remove blur even on error
+      removeBlur();
     }
     
     isTranslating = false;
+  }
+  
+  // Translate only visible (above-the-fold) content
+  async function translateVisibleContent(root) {
+    const viewportHeight = window.innerHeight;
+    const textNodes = collectTextNodes(root).filter(node => {
+      const parent = node.parentElement;
+      if (!parent) return false;
+      
+      const rect = parent.getBoundingClientRect();
+      // Include elements that are visible or within 200px below viewport
+      return rect.top < viewportHeight + 200;
+    });
+    
+    const attrNodes = collectAttributeNodes(root).filter(a => {
+      const rect = a.element.getBoundingClientRect();
+      return rect.top < viewportHeight + 200;
+    });
+    
+    const texts = [
+      ...textNodes.map(n => n.nodeValue.trim()),
+      ...attrNodes.map(a => a.text)
+    ];
+    
+    if (texts.length === 0) return;
+    
+    await translateTexts(texts);
+    
+    // Apply translations
+    textNodes.forEach((node, i) => {
+      const translated = translationCache.get(texts[i]);
+      if (translated && translated !== texts[i]) {
+        node.nodeValue = translated;
+        translatedNodes.add(node);
+      }
+    });
+    
+    attrNodes.forEach((a, i) => {
+      const translated = translationCache.get(texts[textNodes.length + i]);
+      if (translated && translated !== texts[textNodes.length + i]) {
+        a.element.setAttribute(a.attribute, translated);
+        translatedNodes.add(a.element);
+      }
+    });
+  }
+  
+  // Translate content below the fold
+  async function translateBelowFoldContent(root) {
+    const viewportHeight = window.innerHeight;
+    const textNodes = collectTextNodes(root).filter(node => {
+      const parent = node.parentElement;
+      if (!parent) return false;
+      
+      const rect = parent.getBoundingClientRect();
+      // Only elements below viewport + 200px buffer
+      return rect.top >= viewportHeight + 200;
+    });
+    
+    const attrNodes = collectAttributeNodes(root).filter(a => {
+      const rect = a.element.getBoundingClientRect();
+      return rect.top >= viewportHeight + 200;
+    });
+    
+    const texts = [
+      ...textNodes.map(n => n.nodeValue.trim()),
+      ...attrNodes.map(a => a.text)
+    ];
+    
+    if (texts.length === 0) return;
+    
+    await translateTexts(texts);
+    
+    // Apply translations
+    textNodes.forEach((node, i) => {
+      const translated = translationCache.get(texts[i]);
+      if (translated && translated !== texts[i]) {
+        node.nodeValue = translated;
+        translatedNodes.add(node);
+      }
+    });
+    
+    attrNodes.forEach((a, i) => {
+      const translated = translationCache.get(texts[textNodes.length + i]);
+      if (translated && translated !== texts[textNodes.length + i]) {
+        a.element.setAttribute(a.attribute, translated);
+        translatedNodes.add(a.element);
+      }
+    });
   }
   
   // Rewrite internal links to include language prefix
