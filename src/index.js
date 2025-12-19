@@ -238,19 +238,58 @@ async function handleDefaultLanguagePage(request, env, ctx, projectConfig, langu
 
 /* ----------------------------------------
    INJECT AUTO-TRANSLATION SCRIPT
-   Now translates BOTH <head> and <body>
+   IMPROVED: Loading spinner + parallel translation
 ----------------------------------------- */
 function injectAutoTranslation(html, lang, apiKey) {
 	if (html.includes('__ALTIFIED_AUTO_TRANSLATE__')) return html;
 
 	const script = `
+<style id="__ALTIFIED_LOADER__">
+  #altified-loader {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(255, 255, 255, 0.95);
+    z-index: 999999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+  
+  .altified-spinner {
+    width: 50px;
+    height: 50px;
+    border: 4px solid #f3f4f6;
+    border-top: 4px solid #3b82f6;
+    border-radius: 50%;
+    animation: altified-spin 0.8s linear infinite;
+  }
+  
+  @keyframes altified-spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+  
+  .altified-loader-text {
+    margin-top: 16px;
+    color: #6b7280;
+    font-size: 14px;
+  }
+</style>
+
+<div id="altified-loader">
+  <div class="altified-spinner"></div>
+  <div class="altified-loader-text">Translating page...</div>
+</div>
+
 <script id="__ALTIFIED_AUTO_TRANSLATE__">
 (function() {
   window.__ALTIFIED_LANG__ = '${lang}';
   window.__ALTIFIED_API_KEY__ = '${apiKey}';
-  
-  // CRITICAL: Hide content until translated to prevent FOUC
-  document.documentElement.style.visibility = 'hidden';
   
   const translationCache = new Map();
   const translatedNodes = new WeakSet();
@@ -263,12 +302,17 @@ function injectAutoTranslation(html, lang, apiKey) {
     init();
   }
   
-  // Safety: Show content after 3 seconds even if translation fails
+  // Safety: Show content after 1.5 seconds even if translation fails
   setTimeout(function() {
-    if (document.documentElement.style.visibility === 'hidden') {
-      document.documentElement.style.visibility = 'visible';
-    }
-  }, 3000);
+    removeLoader();
+  }, 1500);
+  
+  function removeLoader() {
+    var loader = document.getElementById('altified-loader');
+    var loaderStyle = document.getElementById('__ALTIFIED_LOADER__');
+    if (loader) loader.remove();
+    if (loaderStyle) loaderStyle.remove();
+  }
   
   function init() {
     rewriteInternalLinks();
@@ -276,19 +320,24 @@ function injectAutoTranslation(html, lang, apiKey) {
     startObserver();
   }
   
-  // NEW: Translate both <head> and <body>
+  // IMPROVED: Translate head and body in PARALLEL
   async function translateAllContent() {
     if (isTranslating) return;
     isTranslating = true;
     
-    // Translate <head> content first
-    await translateContent(document.head);
-    
-    // Then translate <body> content
-    await translateContent(document.body);
-    
-    // Show content after translation is done
-    document.documentElement.style.visibility = 'visible';
+    try {
+      // Translate both head and body at the same time
+      await Promise.all([
+        translateContent(document.head),
+        translateContent(document.body)
+      ]);
+      
+      // Remove loader after translation is done
+      removeLoader();
+    } catch (error) {
+      // Remove loader even on error
+      removeLoader();
+    }
     
     isTranslating = false;
   }
