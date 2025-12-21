@@ -3,6 +3,7 @@
  * Translates both <head> and <body> content
  * Fetches enabled languages dynamically from API
  * IMPROVED: Loading spinner + sequential translation (head first, then body)
+ * NEW: Auto-detect browser language and navigate to appropriate language path
  */
 
 const CONFIG = {
@@ -46,7 +47,7 @@ export default {
 				return handleTranslatedRequest(request, url, lang, originalPath, env, ctx, projectConfig, languageNames);
 			}
 
-			// Default: passthrough + inject switcher on default language pages
+			// Default: passthrough + inject switcher + AUTO LANGUAGE DETECTION
 			return handleDefaultLanguagePage(request, env, ctx, projectConfig, languageNames);
 		} catch (error) {
 			return fetch(request); // Passthrough on any error
@@ -224,6 +225,9 @@ async function handleDefaultLanguagePage(request, env, ctx, projectConfig, langu
 
 		let html = await response.text();
 
+		// Inject auto language detection script
+		html = injectAutoLanguageDetection(html, projectConfig);
+
 		// Inject language switcher on default language pages too
 		html = injectLanguageSwitcher(html, projectConfig, languageNames);
 
@@ -235,6 +239,51 @@ async function handleDefaultLanguagePage(request, env, ctx, projectConfig, langu
 	} catch (error) {
 		return fetch(request);
 	}
+}
+
+/* ----------------------------------------
+   INJECT AUTO LANGUAGE DETECTION SCRIPT
+   Detects browser language and navigates to appropriate path
+----------------------------------------- */
+function injectAutoLanguageDetection(html, projectConfig) {
+	if (html.includes('__ALTIFIED_AUTO_LANG_DETECT__')) return html;
+
+	const defaultLang = projectConfig.default_language || 'en';
+	const targetLangs = JSON.stringify(projectConfig.target_languages || []);
+
+	const script = `
+<script id="__ALTIFIED_AUTO_LANG_DETECT__">
+(function() {
+  // Check if we've already done language detection this session
+  if (sessionStorage.getItem('altified_lang_detected')) {
+    return;
+  }
+
+  // Get browser language (e.g., "en-US" -> "en", "fr-FR" -> "fr")
+  var browserLang = navigator.language || navigator.userLanguage;
+  var langCode = browserLang.split('-')[0].toLowerCase();
+
+  // Available target languages
+  var targetLanguages = ${targetLangs};
+  var defaultLanguage = '${defaultLang}';
+
+  // Mark as detected to avoid loops
+  sessionStorage.setItem('altified_lang_detected', 'true');
+
+  // If browser language matches a target language (and it's not the default)
+  if (targetLanguages.includes(langCode) && langCode !== defaultLanguage) {
+    var currentPath = window.location.pathname;
+    var newPath = '/' + langCode + currentPath;
+    
+    // Navigate to the language-specific path
+    window.location.href = newPath + window.location.search + window.location.hash;
+  }
+  // Otherwise, stay on default language (do nothing)
+})();
+</script>
+`;
+
+	return html.replace(/<head[^>]*>/, (match) => match + script);
 }
 
 /* ----------------------------------------
