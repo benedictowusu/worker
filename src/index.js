@@ -1,16 +1,13 @@
 /**
  * Altified Cloudflare Worker - Auto-inject Translation
- * Translates both <head> and <body> content
- * Fetches enabled languages dynamically from API
- * IMPROVED: Loading spinner + sequential translation (head first, then body)
- * NEW: Auto-detect browser language and navigate to appropriate language path
+ * FIXED VERSION: Parallel translation + proper caching + corrected hreflang
  */
 
 const CONFIG = {
 	ALTIFIED_API: 'https://api.altified.com',
 	PLAN_STATUS_ENDPOINT: '/plan-status/',
 	LANGUAGES_ENDPOINT: '/languages/',
-	CACHE_TTL: 3600, // Cache language config for 1 hour
+	CACHE_TTL: 3600,
 };
 
 export default {
@@ -20,17 +17,15 @@ export default {
 			const apiKey = env.ALTIFIED_API_KEY;
 
 			if (!apiKey) {
-				return fetch(request); // Passthrough if no API key
+				return fetch(request);
 			}
 
-			// Fetch project configuration (with caching)
 			const projectConfig = await getProjectConfig(apiKey);
 
 			if (!projectConfig || !projectConfig.target_languages) {
-				return fetch(request); // Passthrough if config fails
+				return fetch(request);
 			}
 
-			// Fetch language names (with caching)
 			const languageNames = await getLanguageNames();
 
 			const { default_language, target_languages } = projectConfig;
@@ -39,7 +34,6 @@ export default {
 			const parts = url.pathname.split('/').filter(Boolean);
 			const firstSegment = parts[0];
 
-			// Language-prefixed route
 			if (enabledLanguages.includes(firstSegment)) {
 				const lang = firstSegment;
 				const originalPath = '/' + parts.slice(1).join('/');
@@ -47,31 +41,25 @@ export default {
 				return handleTranslatedRequest(request, url, lang, originalPath, env, ctx, projectConfig, languageNames);
 			}
 
-			// Default: passthrough + inject switcher + AUTO LANGUAGE DETECTION
 			return handleDefaultLanguagePage(request, env, ctx, projectConfig, languageNames);
 		} catch (error) {
-			return fetch(request); // Passthrough on any error
+			return fetch(request);
 		}
 	},
 };
 
-// Fetch project configuration from API with caching
 async function getProjectConfig(apiKey) {
 	try {
 		const cacheKey = new Request(`https://cache.internal/project_config_${apiKey}`);
 		const cache = caches.default;
 
-		// Try to get from cache
 		try {
 			const cachedResponse = await cache.match(cacheKey);
 			if (cachedResponse) {
 				return await cachedResponse.json();
 			}
-		} catch (e) {
-			// Cache miss
-		}
+		} catch (e) {}
 
-		// Fetch from API
 		const response = await fetch(`${CONFIG.ALTIFIED_API}${CONFIG.PLAN_STATUS_ENDPOINT}?api_key=${apiKey}`, {
 			headers: {
 				Accept: 'application/json',
@@ -84,7 +72,6 @@ async function getProjectConfig(apiKey) {
 
 		const data = await response.json();
 
-		// Cache the response
 		try {
 			const cacheResponse = new Response(JSON.stringify(data), {
 				headers: {
@@ -94,9 +81,7 @@ async function getProjectConfig(apiKey) {
 			});
 
 			await cache.put(cacheKey, cacheResponse);
-		} catch (e) {
-			// Failed to cache
-		}
+		} catch (e) {}
 
 		return data;
 	} catch (error) {
@@ -104,23 +89,18 @@ async function getProjectConfig(apiKey) {
 	}
 }
 
-// Fetch language names from API with caching
 async function getLanguageNames() {
 	try {
 		const cacheKey = new Request(`https://cache.internal/language_names`);
 		const cache = caches.default;
 
-		// Try to get from cache
 		try {
 			const cachedResponse = await cache.match(cacheKey);
 			if (cachedResponse) {
 				return await cachedResponse.json();
 			}
-		} catch (e) {
-			// Cache miss
-		}
+		} catch (e) {}
 
-		// Fetch from API
 		const response = await fetch(`${CONFIG.ALTIFIED_API}${CONFIG.LANGUAGES_ENDPOINT}`, {
 			headers: {
 				Accept: 'application/json',
@@ -133,7 +113,6 @@ async function getLanguageNames() {
 
 		const data = await response.json();
 
-		// Convert array to object for easier lookup: { "en": "English", "fr": "Français", ... }
 		const languageMap = {};
 		if (data.languages && Array.isArray(data.languages)) {
 			data.languages.forEach((lang) => {
@@ -143,19 +122,16 @@ async function getLanguageNames() {
 			});
 		}
 
-		// Cache the response
 		try {
 			const cacheResponse = new Response(JSON.stringify(languageMap), {
 				headers: {
 					'Content-Type': 'application/json',
-					'Cache-Control': `public, max-age=${CONFIG.CACHE_TTL * 24}`, // Cache for 24 hours (languages don't change often)
+					'Cache-Control': `public, max-age=${CONFIG.CACHE_TTL * 24}`,
 				},
 			});
 
 			await cache.put(cacheKey, cacheResponse);
-		} catch (e) {
-			// Failed to cache
-		}
+		} catch (e) {}
 
 		return languageMap;
 	} catch (error) {
@@ -166,16 +142,15 @@ async function getLanguageNames() {
 async function handleTranslatedRequest(request, url, lang, originalPath, env, ctx, projectConfig, languageNames) {
 	const cache = caches.default;
 
-	const cacheKey = new Request(url.toString(), {
+	// FIX: Include language in cache key to prevent collision
+	const cacheKey = new Request(`${url.toString()}?__cache_lang=${lang}`, {
 		method: 'GET',
-		headers: { 'X-Lang': lang },
 	});
 
 	const cached = await cache.match(cacheKey);
 	if (cached) return new Response(cached.body, cached);
 
 	try {
-		// 1. Fetch original page
 		const originUrl = new URL(request.url);
 		originUrl.pathname = originalPath || '/';
 
@@ -191,12 +166,12 @@ async function handleTranslatedRequest(request, url, lang, originalPath, env, ct
 
 		let html = await response.text();
 
-		// 2. Inject auto-translation script
-		html = injectAutoTranslation(html, lang, env.ALTIFIED_API_KEY);
+		// FIX: Extract origin from request URL
+		const origin = `${url.protocol}//${url.host}`;
 
-		// 3. Add metadata
+		html = injectAutoTranslation(html, lang, env.ALTIFIED_API_KEY);
 		html = injectLanguageContext(html, lang);
-		html = addHreflangLinks(html, originUrl.pathname, projectConfig, env.DOMAIN);
+		html = addHreflangLinks(html, originalPath, projectConfig, origin);
 		html = injectLanguageSwitcher(html, projectConfig, languageNames);
 
 		const finalResponse = new Response(html, {
@@ -225,10 +200,7 @@ async function handleDefaultLanguagePage(request, env, ctx, projectConfig, langu
 
 		let html = await response.text();
 
-		// Inject auto language detection script
 		html = injectAutoLanguageDetection(html, projectConfig);
-
-		// Inject language switcher on default language pages too
 		html = injectLanguageSwitcher(html, projectConfig, languageNames);
 
 		return new Response(html, {
@@ -241,10 +213,6 @@ async function handleDefaultLanguagePage(request, env, ctx, projectConfig, langu
 	}
 }
 
-/* ----------------------------------------
-   INJECT AUTO LANGUAGE DETECTION SCRIPT
-   Detects browser language and navigates to appropriate path
------------------------------------------ */
 function injectAutoLanguageDetection(html, projectConfig) {
 	if (html.includes('__ALTIFIED_AUTO_LANG_DETECT__')) return html;
 
@@ -254,31 +222,24 @@ function injectAutoLanguageDetection(html, projectConfig) {
 	const script = `
 <script id="__ALTIFIED_AUTO_LANG_DETECT__">
 (function() {
-  // Check if we've already done language detection this session
   if (sessionStorage.getItem('altified_lang_detected')) {
     return;
   }
 
-  // Get browser language (e.g., "en-US" -> "en", "fr-FR" -> "fr")
   var browserLang = navigator.language || navigator.userLanguage;
   var langCode = browserLang.split('-')[0].toLowerCase();
 
-  // Available target languages
   var targetLanguages = ${targetLangs};
   var defaultLanguage = '${defaultLang}';
 
-  // Mark as detected to avoid loops
   sessionStorage.setItem('altified_lang_detected', 'true');
 
-  // If browser language matches a target language (and it's not the default)
   if (targetLanguages.includes(langCode) && langCode !== defaultLanguage) {
     var currentPath = window.location.pathname;
     var newPath = '/' + langCode + currentPath;
     
-    // Navigate to the language-specific path
     window.location.href = newPath + window.location.search + window.location.hash;
   }
-  // Otherwise, stay on default language (do nothing)
 })();
 </script>
 `;
@@ -287,8 +248,8 @@ function injectAutoLanguageDetection(html, projectConfig) {
 }
 
 /* ----------------------------------------
-   INJECT AUTO-TRANSLATION SCRIPT
-   IMPROVED: Loading spinner + sequential translation
+   FIXED: Parallel translation (everything at once)
+   + Timeout fallback to prevent infinite blur
 ----------------------------------------- */
 function injectAutoTranslation(html, lang, apiKey) {
 	if (html.includes('__ALTIFIED_AUTO_TRANSLATE__')) return html;
@@ -316,7 +277,6 @@ function injectAutoTranslation(html, lang, apiKey) {
   const translatedNodes = new WeakSet();
   let isTranslating = false;
   
-  // Initialize
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
@@ -331,143 +291,62 @@ function injectAutoTranslation(html, lang, apiKey) {
   
   function removeBlur() {
     document.documentElement.classList.add('altified-translated');
-    // Remove blur style after transition completes
     setTimeout(function() {
       var blurStyle = document.getElementById('__ALTIFIED_BLUR__');
       if (blurStyle) blurStyle.remove();
     }, 300);
   }
   
-  // Parallel translation: head and visible body at the same time (FASTEST)
+  // FIXED: Translate everything in parallel with timeout fallback
   async function translateAllContent() {
     if (isTranslating) return;
     isTranslating = true;
     
+    // 5 second timeout to prevent infinite blur
+    const timeout = new Promise(resolve => setTimeout(resolve, 5000));
+    
     try {
-      // Translate head and visible body content in PARALLEL
-      await Promise.all([
-        translateContent(document.head),
-        translateVisibleContent(document.body)
+      await Promise.race([
+        Promise.all([
+          translateContent(document.head),
+          translateContent(document.body)
+        ]),
+        timeout
       ]);
-      
-      // Remove blur after both are done
-      removeBlur();
-      
-      // Translate remaining below-the-fold content in background
-      await translateBelowFoldContent(document.body);
-      
     } catch (error) {
-      // Remove blur even on error
+      console.error('Translation error:', error);
+    } finally {
+      // ALWAYS remove blur, even on error/timeout
       removeBlur();
+      isTranslating = false;
     }
-    
-    isTranslating = false;
   }
   
-  // Translate only visible (above-the-fold) content
-  async function translateVisibleContent(root) {
-    const viewportHeight = window.innerHeight;
-    const textNodes = collectTextNodes(root).filter(node => {
-      const parent = node.parentElement;
-      if (!parent) return false;
-      
-      const rect = parent.getBoundingClientRect();
-      // Include elements that are visible or within 200px below viewport
-      return rect.top < viewportHeight + 200;
-    });
-    
-    const attrNodes = collectAttributeNodes(root).filter(a => {
-      const rect = a.element.getBoundingClientRect();
-      return rect.top < viewportHeight + 200;
-    });
-    
-    const texts = [
-      ...textNodes.map(n => n.nodeValue.trim()),
-      ...attrNodes.map(a => a.text)
-    ];
-    
-    if (texts.length === 0) return;
-    
-    await translateTexts(texts);
-    
-    // Apply translations
-    textNodes.forEach((node, i) => {
-      const translated = translationCache.get(texts[i]);
-      if (translated && translated !== texts[i]) {
-        node.nodeValue = translated;
-        translatedNodes.add(node);
-      }
-    });
-    
-    attrNodes.forEach((a, i) => {
-      const translated = translationCache.get(texts[textNodes.length + i]);
-      if (translated && translated !== texts[textNodes.length + i]) {
-        a.element.setAttribute(a.attribute, translated);
-        translatedNodes.add(a.element);
-      }
-    });
-  }
-  
-  // Translate content below the fold
-  async function translateBelowFoldContent(root) {
-    const viewportHeight = window.innerHeight;
-    const textNodes = collectTextNodes(root).filter(node => {
-      const parent = node.parentElement;
-      if (!parent) return false;
-      
-      const rect = parent.getBoundingClientRect();
-      // Only elements below viewport + 200px buffer
-      return rect.top >= viewportHeight + 200;
-    });
-    
-    const attrNodes = collectAttributeNodes(root).filter(a => {
-      const rect = a.element.getBoundingClientRect();
-      return rect.top >= viewportHeight + 200;
-    });
-    
-    const texts = [
-      ...textNodes.map(n => n.nodeValue.trim()),
-      ...attrNodes.map(a => a.text)
-    ];
-    
-    if (texts.length === 0) return;
-    
-    await translateTexts(texts);
-    
-    // Apply translations
-    textNodes.forEach((node, i) => {
-      const translated = translationCache.get(texts[i]);
-      if (translated && translated !== texts[i]) {
-        node.nodeValue = translated;
-        translatedNodes.add(node);
-      }
-    });
-    
-    attrNodes.forEach((a, i) => {
-      const translated = translationCache.get(texts[textNodes.length + i]);
-      if (translated && translated !== texts[textNodes.length + i]) {
-        a.element.setAttribute(a.attribute, translated);
-        translatedNodes.add(a.element);
-      }
-    });
-  }
-  
-  // Rewrite internal links to include language prefix
   function rewriteInternalLinks() {
-    const links = document.querySelectorAll('a[href]');
+    var links = document.querySelectorAll('a[href]');
+    var langPrefix = '/${lang}';
     
-    links.forEach(link => {
-      const href = link.getAttribute('href');
+    links.forEach(function(link) {
+      var href = link.getAttribute('href');
       
-      // Only rewrite relative internal links
       if (!href) return;
       if (href.startsWith('http://') || href.startsWith('https://')) return;
       if (href.startsWith('#')) return;
       if (href.startsWith('mailto:') || href.startsWith('tel:')) return;
       
-      // If link doesn't already have language prefix, add it
-      if (!href.startsWith('/${lang}/') && href !== '/${lang}') {
-        const newHref = href === '/' ? '/${lang}' : '/${lang}' + href;
+      if (!href.startsWith(langPrefix + '/') && href !== langPrefix) {
+        var newHref;
+        if (href === '/') {
+          newHref = langPrefix;
+        } else if (href.startsWith('/')) {
+          newHref = langPrefix + href;
+        } else {
+          if (href.startsWith('./')) {
+            newHref = langPrefix + '/' + href.substring(2);
+          } else {
+            newHref = langPrefix + '/' + href;
+          }
+        }
         link.setAttribute('href', newHref);
       }
     });
@@ -487,7 +366,6 @@ function injectAutoTranslation(html, lang, apiKey) {
     
     await translateTexts(texts);
     
-    // Apply translations to text nodes
     textNodes.forEach((node, i) => {
       const translated = translationCache.get(texts[i]);
       if (translated && translated !== texts[i]) {
@@ -496,7 +374,6 @@ function injectAutoTranslation(html, lang, apiKey) {
       }
     });
     
-    // Apply translations to attributes
     attrNodes.forEach((a, i) => {
       const translated = translationCache.get(texts[textNodes.length + i]);
       if (translated && translated !== texts[textNodes.length + i]) {
@@ -525,7 +402,6 @@ function injectAutoTranslation(html, lang, apiKey) {
         continue;
       }
       
-      // For <head>, also translate <title> and <meta> description/keywords
       if (root === document.head) {
         if (['TITLE'].includes(tagName)) {
           nodes.push(node);
@@ -541,7 +417,6 @@ function injectAutoTranslation(html, lang, apiKey) {
   function collectAttributeNodes(root) {
     const attrs = [];
     
-    // Standard attributes to translate
     const elements = root.querySelectorAll('[alt], [title], [placeholder], [aria-label]');
     
     elements.forEach(el => {
@@ -553,40 +428,26 @@ function injectAutoTranslation(html, lang, apiKey) {
       });
     });
     
-    // For <head>, also translate meta description, keywords, and og:title/description
     if (root === document.head) {
-      const metaDesc = root.querySelector('meta[name="description"]');
-      if (metaDesc) {
-        const content = metaDesc.getAttribute('content');
-        if (content && content.trim() && !translatedNodes.has(metaDesc)) {
-          attrs.push({ element: metaDesc, attribute: 'content', text: content.trim() });
-        }
-      }
+      const metaSelectors = [
+        'meta[name="title"]',
+        'meta[name="description"]',
+        'meta[name="keywords"]',
+        'meta[property="og:title"]',
+        'meta[property="og:description"]',
+        'meta[name="twitter:title"]',
+        'meta[name="twitter:description"]'
+      ];
       
-      const metaKeywords = root.querySelector('meta[name="keywords"]');
-      if (metaKeywords) {
-        const content = metaKeywords.getAttribute('content');
-        if (content && content.trim() && !translatedNodes.has(metaKeywords)) {
-          attrs.push({ element: metaKeywords, attribute: 'content', text: content.trim() });
+      metaSelectors.forEach(selector => {
+        const meta = root.querySelector(selector);
+        if (meta) {
+          const content = meta.getAttribute('content');
+          if (content && content.trim() && !translatedNodes.has(meta)) {
+            attrs.push({ element: meta, attribute: 'content', text: content.trim() });
+          }
         }
-      }
-      
-      // Open Graph tags
-      const ogTitle = root.querySelector('meta[property="og:title"]');
-      if (ogTitle) {
-        const content = ogTitle.getAttribute('content');
-        if (content && content.trim() && !translatedNodes.has(ogTitle)) {
-          attrs.push({ element: ogTitle, attribute: 'content', text: content.trim() });
-        }
-      }
-      
-      const ogDesc = root.querySelector('meta[property="og:description"]');
-      if (ogDesc) {
-        const content = ogDesc.getAttribute('content');
-        if (content && content.trim() && !translatedNodes.has(ogDesc)) {
-          attrs.push({ element: ogDesc, attribute: 'content', text: content.trim() });
-        }
-      }
+      });
     }
     
     return attrs;
@@ -622,29 +483,93 @@ function injectAutoTranslation(html, lang, apiKey) {
       
       return data;
     } catch (err) {
+      console.error('Translation API error:', err);
       return null;
     }
   }
   
   function startObserver() {
-    let timer = null;
-    
-    function scheduleTranslation() {
-      clearTimeout(timer);
-      timer = setTimeout(() => {
-        translateAllContent();
-        // Also rewrite any new links added dynamically
-        rewriteInternalLinks();
-      }, 400);
-    }
-    
-    const observer = new MutationObserver(() => scheduleTranslation());
+    const observer = new MutationObserver((mutations) => {
+      const newNodes = [];
+      
+      mutations.forEach(mutation => {
+        mutation.addedNodes.forEach(node => {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            if (!translatedNodes.has(node) && !node.closest('[translate="no"]')) {
+              newNodes.push(node);
+            }
+          }
+        });
+      });
+      
+      if (newNodes.length > 0) {
+        translateNewNodes(newNodes);
+      }
+    });
     
     observer.observe(document.body, {
       childList: true,
-      subtree: true,
-      characterData: true
+      subtree: true
     });
+  }
+  
+  async function translateNewNodes(nodes) {
+    for (const node of nodes) {
+      const textNodes = collectTextNodes(node);
+      const attrNodes = collectAttributeNodes(node);
+      
+      const texts = [
+        ...textNodes.map(n => n.nodeValue.trim()),
+        ...attrNodes.map(a => a.text)
+      ];
+      
+      if (texts.length === 0) continue;
+      
+      await translateTexts(texts);
+      
+      textNodes.forEach((textNode, i) => {
+        const translated = translationCache.get(texts[i]);
+        if (translated && translated !== texts[i]) {
+          textNode.nodeValue = translated;
+          translatedNodes.add(textNode);
+        }
+      });
+      
+      attrNodes.forEach((a, i) => {
+        const translated = translationCache.get(texts[textNodes.length + i]);
+        if (translated && translated !== texts[textNodes.length + i]) {
+          a.element.setAttribute(a.attribute, translated);
+          translatedNodes.add(a.element);
+        }
+      });
+      
+      const links = node.querySelectorAll ? node.querySelectorAll('a[href]') : [];
+      links.forEach(function(link) {
+        var href = link.getAttribute('href');
+        var langPrefix = '/${lang}';
+        
+        if (!href) return;
+        if (href.startsWith('http://') || href.startsWith('https://')) return;
+        if (href.startsWith('#')) return;
+        if (href.startsWith('mailto:') || href.startsWith('tel:')) return;
+        
+        if (!href.startsWith(langPrefix + '/') && href !== langPrefix) {
+          var newHref;
+          if (href === '/') {
+            newHref = langPrefix;
+          } else if (href.startsWith('/')) {
+            newHref = langPrefix + href;
+          } else {
+            if (href.startsWith('./')) {
+              newHref = langPrefix + '/' + href.substring(2);
+            } else {
+              newHref = langPrefix + '/' + href;
+            }
+          }
+          link.setAttribute('href', newHref);
+        }
+      });
+    }
   }
   
 })();
@@ -667,39 +592,34 @@ function injectLanguageContext(html, lang) {
 	return html.replace(/<head[^>]*>/, (match) => match + script);
 }
 
-function addHreflangLinks(html, pathname, projectConfig, domain) {
-	if (html.includes('hreflang=')) return html;
+// FIX: Better hreflang check + use origin parameter correctly
+function addHreflangLinks(html, pathname, projectConfig, origin) {
+	// FIX: More precise check for existing hreflang tags
+	if (html.match(/<link[^>]+rel=["']alternate["'][^>]+hreflang=/i)) return html;
 
-	const origin = domain; // Fallback if domain not set
 	const defaultLang = projectConfig.default_language || 'en';
 	const targetLangs = projectConfig.target_languages || [];
 
-	let tags = `
-<link rel="alternate" hreflang="${defaultLang}" href="${origin}${pathname}" />
-`;
+	let tags = `<link rel="alternate" hreflang="${defaultLang}" href="${origin}${pathname}" />`;
 
 	targetLangs.forEach((lang) => {
-		tags += `
-<link rel="alternate" hreflang="${lang}" href="${origin}/${lang}${pathname}" />`;
+		tags += `<link rel="alternate" hreflang="${lang}" href="${origin}/${lang}${pathname}" />`;
 	});
 
-	tags += `
-<link rel="alternate" hreflang="x-default" href="${origin}${pathname}" />
-`;
+	tags += `<link rel="alternate" hreflang="x-default" href="${origin}${pathname}" />`;
 
 	return html.replace('</head>', `${tags}\n</head>`);
 }
 
 function injectLanguageSwitcher(html, projectConfig, languageNames = {}) {
-	if (html.includes('altified-lang-switcher')) return html;
+	// FIX: More precise check
+	if (html.match(/<[^>]+class=["']altified-lang-switcher["']/)) return html;
 
 	const defaultLang = projectConfig.default_language || 'en';
 	const targetLangs = projectConfig.target_languages || [];
 
-	// Get language name from the map, fallback to uppercase code
 	const getLanguageName = (code) => languageNames[code] || code.toUpperCase();
 
-	// Generate language options with full names
 	const languageOptions = [
 		`<option value="${defaultLang}">${getLanguageName(defaultLang)}</option>`,
 		...targetLangs.map((l) => `<option value="${l}">${getLanguageName(l)}</option>`),
@@ -731,7 +651,7 @@ function injectLanguageSwitcher(html, projectConfig, languageNames = {}) {
 
 <div class="altified-lang-switcher">
   <select id="altified-lang-select">
-    <option value="">🌐 Language</option>
+    <option value="">Language</option>
     ${languageOptions}
   </select>
 </div>
